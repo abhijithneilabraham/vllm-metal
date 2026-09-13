@@ -154,7 +154,7 @@ def check_parity(
     top_k: int | None = None,
     batch_sizes: tuple[int, ...] = (1, 2),
     output_dir: Path | None = None,
-    gpu_memory_utilization: float = 0.3,
+    gpu_memory_utilization: float = 0.65,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -404,8 +404,8 @@ def main() -> None:
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.3,
-        help="KV budget fraction passed to the vLLM server (default: 0.3)",
+        default=0.65,
+        help="KV budget fraction passed to the vLLM server (default: 0.65)",
     )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
