@@ -1530,11 +1530,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       }
 
       // Compute correction factor to rescale previous state.
-      float new_m = max(warp_m[r], block_max);
-      // NaN-safe: if new_m is still -inf (all masked), clamp to 0.
-      if (new_m == -FLT_MAX) new_m = 0.f;
+      const float new_m = max(warp_m[r], block_max);
+      // A row with no unmasked key yet keeps -FLT_MAX as its running max;
+      // only the exponent base is clamped, so the max is never pinned at 0.
+      const float base = (new_m == -FLT_MAX) ? 0.f : new_m;
 
-      float old_correction = exp2(warp_m[r] - new_m);
+      float old_correction = exp2(warp_m[r] - base);
       // If warp_m was -FLT_MAX (first iteration), correction = 0, which
       // correctly zeroes out the (already zero) previous O and l.
       if (warp_m[r] == -FLT_MAX) old_correction = 0.f;
@@ -1574,7 +1575,8 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           continue;
         }
         const float score = warp_scores[r * BLOCK_SIZE + tok];
-        w[r] = exp2(score - warp_m[r]);
+        const float base = (warp_m[r] == -FLT_MAX) ? 0.f : warp_m[r];
+        w[r] = exp2(score - base);
         warp_l[r] += w[r];
       }
 

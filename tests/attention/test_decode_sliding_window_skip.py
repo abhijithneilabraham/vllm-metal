@@ -342,6 +342,55 @@ def test_window_mode_row_with_fully_masked_partition_stays_neutral(
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.parametrize("group_first_row", [0, PA_WINDOW_ROWS])
+def test_window_mode_row_with_fully_masked_block_stays_neutral(
+    group_first_row,
+) -> None:
+    """Window mode reads blocks from the window start of its threadgroup's
+    first row.  When that start is a block's last token, the block is fully
+    masked for the next row: no key in it may update the row's running max,
+    or the max is pinned at 0 and the row's in-window keys, all scoring far
+    below 0, are weighted down to nothing.  Scores as in
+    test_partitioned_window_with_strongly_negative_scores."""
+    heads, kv_heads, hd = 4, 2, 64
+    window, q_len, magnitude = 96, 2 * PA_WINDOW_ROWS, 2.0
+    assert PA_WINDOW_ROWS >= 2
+    assert heads * q_len < get_ops().min_decode_grid()
+    seq_len = 1500
+    while (seq_len - q_len + group_first_row - window + 1) % BLOCK != BLOCK - 1:
+        seq_len += 1
+    key_cache, value_cache, table, rows = _cache(
+        1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
+    mx.random.seed(3)
+    query = (mx.ones((q_len, heads, hd)) * magnitude).astype(DTYPE)
+    key_cache = (
+        -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
+    ).astype(DTYPE)
+    mx.eval(query, key_cache)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, q_len],
+        window=window,
+        window_seqlen_q=q_len,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        rows[0],
+        q_lo=seq_len - q_len,
+        seq_len=seq_len,
+        window=window,
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+
+
 def _zero_window_output(query, key_cache, value_cache, table, **common):
     """Decode with sliding_window == 0, which masks every key: the neutral
     result is a zero output.  A full-attention call of the same shape runs
