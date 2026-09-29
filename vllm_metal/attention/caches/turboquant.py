@@ -103,6 +103,10 @@ BOUNDARIES_3BIT = mx.array(
 # and the scale cache allocation in kv_cache.py (head_dim // 32 groups).
 BLOCK_SIZE = 32
 
+# Smallest normal float16; a scale below it flushes to 0 in half precision and
+# yields NaN.  Must match ``TQ_MIN_SCALE`` in turboquant.metal.
+TQ_MIN_SCALE = 2.0**-14
+
 # === Quantization parameters ===
 # - "signed":  True  → stored as int8 (char in Metal), idx in [-max, max]
 #              False → stored as uint8 (uchar in Metal), idx in [0, max]
@@ -466,10 +470,10 @@ def quantize(
         # scale * (max_val - (-max_val)) = x_max - x_min  →  scale = (x_max-x_min)/(2*max_val)
         # Zero-point centers the quantization grid on the block midpoint.
         max_val = (1 << (bits - 1)) - 1
-        scale = (x_max - x_min) / (2.0 * max_val)
-        zero_point = mx.round((x_max + x_min) / (2.0 * (scale + 1e-8)))
+        scale = _block_scale(x_min, x_max, 2.0 * max_val)
+        zero_point = mx.round((x_max + x_min) / (2.0 * scale))
         indices = mx.clip(
-            mx.round(x / (scale + 1e-8) - zero_point),
+            mx.round(x / scale - zero_point),
             -max_val,
             max_val,
         ).astype(dtype)
@@ -478,10 +482,10 @@ def quantize(
         # x_min corresponds to idx=0 (via zero_point offset). This keeps all
         # indices non-negative, which is required for correct bit packing.
         max_val = (1 << bits) - 1
-        scale = (x_max - x_min) / max_val
-        zero_point = mx.round(x_min / (scale + 1e-8))
+        scale = _block_scale(x_min, x_max, float(max_val))
+        zero_point = mx.round(x_min / scale)
         indices = mx.clip(
-            mx.round(x / (scale + 1e-8) - zero_point),
+            mx.round(x / scale - zero_point),
             0,
             max_val,
         ).astype(dtype)
@@ -492,6 +496,15 @@ def quantize(
         scale.squeeze(-1).astype(mx.float16),
         zero_point.squeeze(-1).astype(mx.float16),
     )
+
+
+def _block_scale(x_min: mx.array, x_max: mx.array, levels: float) -> mx.array:
+    """Quantization step per block, kept representable in float16."""
+    scale = (x_max - x_min) / levels
+    fallback = mx.maximum(
+        mx.maximum(mx.abs(x_min), mx.abs(x_max)) / levels, TQ_MIN_SCALE
+    )
+    return mx.where(scale < TQ_MIN_SCALE, fallback, scale)
 
 
 def dequantize(
