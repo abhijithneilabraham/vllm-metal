@@ -356,9 +356,8 @@ def test_window_mode_row_with_fully_masked_block_stays_neutral(
     window, q_len, magnitude = 96, 2 * PA_WINDOW_ROWS, 2.0
     assert PA_WINDOW_ROWS >= 2
     assert heads * q_len < get_ops().min_decode_grid()
-    seq_len = 1500
-    while (seq_len - q_len + group_first_row - window + 1) % BLOCK != BLOCK - 1:
-        seq_len += 1
+    window_start = 1500 - q_len + group_first_row - window + 1
+    seq_len = 1500 + (BLOCK - 1 - window_start) % BLOCK
     key_cache, value_cache, table, rows = _cache(
         1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
     )
