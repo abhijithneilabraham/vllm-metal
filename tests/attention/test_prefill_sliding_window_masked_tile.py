@@ -26,6 +26,7 @@ from tests.attention.test_bidi_prefill_kernel import (
 )
 
 TILE_KV = 32  # TileConfig for head sizes 64, 96 and 128
+assert HD in (64, 96, 128), "TILE_KV above is the tile size for these head sizes"
 ATOL, RTOL = 1.5e-2, 1e-2
 
 
@@ -57,9 +58,8 @@ def test_rows_whose_first_tile_is_fully_masked_stay_neutral(
     masked when the threadgroup's window starts `offset` tokens into a
     tile; offset 0 is the control where no row does."""
     n, window, magnitude = 2 * TILE_KV, 96, 2.0
-    seq_len = 600
-    while (seq_len - n + 1 - window) % TILE_KV != window_start_in_tile:
-        seq_len += 1
+    window_start = 600 - n + 1 - window
+    seq_len = 600 + (window_start_in_tile - window_start) % TILE_KV
     key_cache, value_cache, _, table = _setup(0, n=n, seq_len=seq_len)
     mx.random.seed(3)
     query = (mx.ones((n, HEADS, HD)) * magnitude).astype(DTYPE)

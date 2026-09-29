@@ -463,9 +463,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     } else {
       factor = 1.0f;
     }
-    // A row with no unmasked key yet keeps -INFINITY as its running max;
-    // only the exponent base is clamped, so the max is never pinned at 0.
-    const float base = (new_max == -INFINITY) ? 0.0f : new_max;
+    const float exp_base = (new_max == -INFINITY) ? 0.0f : new_max;
     max_score = new_max;
 
     // ─ Exponentiate + row sum ───────────────────────────────────────────
@@ -476,7 +474,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       for (int jj = 0; jj < 2; jj++) {
         float p = (Sreg[k][jj] == -INFINITY)
                       ? 0.0f
-                      : fast::exp2(Sreg[k][jj] - base);
+                      : fast::exp2(Sreg[k][jj] - exp_base);
         Sreg[k][jj] = p;
         local_sum += p;
       }
