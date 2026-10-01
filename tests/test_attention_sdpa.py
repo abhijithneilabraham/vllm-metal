@@ -22,6 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx.utils import tree_flatten
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
@@ -1043,8 +1044,10 @@ class TestSDPAForward:
         assert isinstance(sinks, mx.array)
         assert sinks.dtype == mx.float32
 
-        # The widened tensor is stored back on the module, so a later forward
-        # skips the astype and hands the kernel the same float32 array.
+        # The widened tensor is memoized off the module, so a later forward
+        # hands the kernel the same float32 array while the parameter keeps
+        # its checkpoint dtype.
+        first_sinks = sinks
         with (
             patch.object(
                 sdpa_mod,
@@ -1060,8 +1063,26 @@ class TestSDPAForward:
         ):
             sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
 
-        assert inner.sinks.dtype == mx.float32
-        assert captured["sinks"] is inner.sinks
+        assert inner.sinks is fp16_sinks
+        assert captured["sinks"] is first_sinks
+
+    def test_float32_sinks_cache_stays_off_the_parameter_tree(self) -> None:
+        class _Attention(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sinks = mx.arange(_N_HEADS, dtype=mx.bfloat16)
+
+        inner = _Attention()
+        first = sdpa_mod._float32_sinks(inner)
+
+        assert first is not None and first.dtype == mx.float32
+        assert sdpa_mod._float32_sinks(inner) is first
+        parameters = dict(tree_flatten(inner.parameters()))
+        assert parameters.keys() == {"sinks"}
+        assert parameters["sinks"].dtype == mx.bfloat16
+
+        inner.sinks = mx.zeros((_N_HEADS,), dtype=mx.bfloat16)
+        assert sdpa_mod._float32_sinks(inner) is not first
 
     def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
         """Drive ``sdpa_forward`` and return the softcap the kernel received."""

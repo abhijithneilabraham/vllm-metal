@@ -568,6 +568,24 @@ def truncate_padded_output(
 # === SDPA forward ===
 
 
+def _float32_sinks(inner: nn.Module) -> mx.array | None:
+    """The module's attention sinks as float32, cast once per parameter.
+
+    The widened copy is stored outside the parameter tree, so the checkpoint
+    weight keeps its dtype for the non-paged fallback and for anything that
+    walks the parameters. It is keyed by the original array, so a reloaded
+    parameter is cast again.
+    """
+    sinks = getattr(inner, "sinks", None)
+    if sinks is None or sinks.dtype == mx.float32:
+        return sinks
+    cached = getattr(inner, "_vllm_metal_sinks_f32", None)
+    if cached is None or cached[0] is not sinks:
+        cached = (sinks, sinks.astype(mx.float32))
+        object.__setattr__(inner, "_vllm_metal_sinks_f32", cached)
+    return cached[1]
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -623,13 +641,9 @@ def sdpa_forward(
     # Attention sinks: a learned per-head logit that joins the softmax
     # denominator without contributing a value row (GPT-OSS). Models without
     # sinks leave this None and the kernel keeps its plain-softmax path.
-    # The kernel reads them as device float, so cast only when the checkpoint
-    # stored them in another dtype; this is the per-layer hot path.  Write the
-    # widened tensor back to the module so the astype runs once instead of
-    # re-entering the lazy graph on every layer of every forward.
-    sinks = getattr(inner, "sinks", None)
-    if sinks is not None and sinks.dtype != mx.float32:
-        sinks = inner.sinks = sinks.astype(mx.float32)
+    # The kernel reads them as device float; the cast is memoized off the
+    # module's parameter tree, since this is the per-layer hot path.
+    sinks = _float32_sinks(inner)
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,
