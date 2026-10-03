@@ -1855,8 +1855,7 @@ static void dispatch_mla_paged_attention(
     if (candidate.kv_lora_rank == kv_lora_rank &&
         candidate.qk_rope_head_dim == qk_rope_head_dim &&
         candidate.block_size == block_size &&
-        candidate.heads_per_tg == heads_per_tg &&
-        candidate.partition_size == 0) {
+        candidate.heads_per_tg == heads_per_tg) {
       spec = &candidate;
       break;
     }
@@ -1874,6 +1873,12 @@ static void dispatch_mla_paged_attention(
         "MLA kernel: num_heads (" + std::to_string(num_heads) +
         ") must be divisible by heads_per_tg (" +
         std::to_string(heads_per_tg) + ")");
+  }
+  if (spec->partition_size != 0) {
+    throw std::runtime_error(
+        "MLA kernel: the dispatch does not partition yet, so a row with "
+        "partition_size=" + std::to_string(spec->partition_size) +
+        " is not dispatchable");
   }
   mla_validate_t_dtypes("MLA kernel", {
       {"q_nope", &q_nope},

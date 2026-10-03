@@ -227,20 +227,39 @@ class TestMLAKernelBlockSizes:
         """
         cpp = self._PAGED_OPS.read_text()
         table = cpp[cpp.index("kMlaKernelSpecs") :]
-        rows = {
+        parsed = [
             tuple(int(v) for v in m.groups())
             for m in re.finditer(
                 r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
                 r"\s*(\d+)\s*,\s*(\d+)\s*\}",
                 table[: table.index("};")],
             )
-        }
-        assert rows, "could not parse the kMlaKernelSpecs table"
-        return rows
+        ]
+        assert parsed, "could not parse the kMlaKernelSpecs table"
+        # The dispatch takes the first row whose geometry matches and ignores
+        # the rest, so two rows may not share one geometry.
+        geometries = [row[:4] for row in parsed]
+        assert len(set(geometries)) == len(geometries), (
+            f"kMlaKernelSpecs rows share a geometry: {sorted(geometries)}"
+        )
+        return set(parsed)
 
     def test_matches_mla_metal_instantiations(self):
         instantiated = {bs for _, _, _, bs, _, _, _ in self._instantiations()}
         assert instantiated == set(MLA_KERNEL_BLOCK_SIZES)
+
+    def test_every_table_row_is_dispatchable(self):
+        """The dispatch runs the kernel unpartitioned, so every row says so.
+
+        ``dispatch_mla_paged_attention`` hardcodes ``use_partitioning`` to
+        false and builds the kernel name from the matched row's
+        ``partition_size``. A row with another value names a kernel the
+        dispatch cannot drive, so it must not reach the table before the
+        dispatch learns to partition.
+        """
+        partition_sizes = {ps for *_, ps in self._gate_rows()}
+
+        assert partition_sizes == {0}
 
     def test_instantiations_match_the_cpp_dispatch_gate(self):
         """Every instantiated specialization must be dispatchable.
