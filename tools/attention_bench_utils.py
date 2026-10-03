@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
+from pathlib import Path
+from types import FunctionType
 
 import mlx.core as mx
 import numpy as np
@@ -32,6 +35,15 @@ def package_versions(*names: str) -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
+
+
+def native_source_hashes(*functions: FunctionType) -> dict[str, str]:
+    """Hash the source file behind each function, keyed by file name."""
+    hashes: dict[str, str] = {}
+    for function in functions:
+        path = Path(function.__code__.co_filename)
+        hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
 
 
 def ref_paged_attn(

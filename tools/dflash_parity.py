@@ -20,8 +20,15 @@ import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 
-from tools.attention_bench_utils import package_versions
+from tools.attention_bench_utils import native_source_hashes, package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture, load_dflash
+from vllm_metal.v1.draft_checkpoint import load_draft_weights
+
+# Every function that decides which weights produce the numbers in a report.
+# load_dflash validates the target and the config; load_draft_weights applies
+# the tensor, precision and finite-value rules; DFlashTargetCapture.run
+# produces the target features the draft reads.
+NATIVE_SOURCES = (load_dflash, load_draft_weights, DFlashTargetCapture.run)
 
 
 def compare(actual: mx.array, expected: mx.array) -> dict:
@@ -198,9 +205,7 @@ def qualify(
         "target": str(target_path.resolve()),
         "draft": str(draft_path.resolve()),
         "reference_sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
-        "native_source_sha256": hashlib.sha256(
-            Path(load_dflash.__code__.co_filename).read_bytes()
-        ).hexdigest(),
+        "native_source_sha256": native_source_hashes(*NATIVE_SOURCES),
         "versions": package_versions("mlx", "mlx-lm", "numpy"),
         "capture_layer_ids": draft.config.capture_layer_ids,
         "draft_layers": draft.config.num_hidden_layers,

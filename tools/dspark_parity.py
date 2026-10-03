@@ -27,10 +27,13 @@ from mlx_lm import load
 from safetensors.torch import load_file
 from transformers import Qwen3Config
 
-from tools.attention_bench_utils import package_versions
+from tools.attention_bench_utils import native_source_hashes, package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, load_dspark
+
+# Every function that decides which weights produce the numbers in a report.
+NATIVE_SOURCES = (load_dspark, load_draft_weights, DFlashTargetCapture.run)
 
 
 def compare(actual, expected, *, atol, rtol):
@@ -217,12 +220,7 @@ def qualify(args):
             name: hashlib.sha256((reference_root / name).read_bytes()).hexdigest()
             for name in sources
         },
-        "native_source_sha256": {
-            Path(function.__code__.co_filename).name: hashlib.sha256(
-                Path(function.__code__.co_filename).read_bytes()
-            ).hexdigest()
-            for function in (load_dspark, load_draft_weights, DFlashTargetCapture.run)
-        },
+        "native_source_sha256": native_source_hashes(*NATIVE_SOURCES),
         "versions": package_versions("mlx", "mlx-lm", "torch", "transformers"),
         "cases": rows,
         "passed": True,
