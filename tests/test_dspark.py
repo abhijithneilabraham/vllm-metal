@@ -462,3 +462,32 @@ def test_confidence_reuses_each_markov_embedding(monkeypatch):
     result = model.greedy_proposal(mx.ones((2, 7, 32)), mx.array([3, 5]))
     mx.eval(result)
     assert calls == [(2,)] * 7
+
+
+@pytest.mark.parametrize("draft_topk", [None, 2])
+def test_corrected_logits_can_be_skipped(monkeypatch, draft_topk):
+    model = DSparkModel(config())
+    hidden = mx.random.normal((2, 7, 32))
+    anchors = mx.array([3, 5])
+    tokens, _, confidence = model.greedy_proposal(
+        hidden, anchors, draft_topk=draft_topk
+    )
+    dense_builds = []
+    original = mx.full_like
+
+    def spy(*args, **kwargs):
+        dense_builds.append(args[0].shape)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "full_like", spy)
+    skipped_tokens, skipped_logits, skipped_confidence = model.greedy_proposal(
+        hidden, anchors, draft_topk=draft_topk, corrected_logits=False
+    )
+
+    np.testing.assert_array_equal(np.array(skipped_tokens), np.array(tokens))
+    assert skipped_logits is None
+    assert dense_builds == []
+    if confidence is None:
+        assert skipped_confidence is None
+    else:
+        np.testing.assert_array_equal(array(skipped_confidence), array(confidence))

@@ -202,7 +202,8 @@ class DSparkModel(nn.Module):
         anchors: mx.array,
         *,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        corrected_logits: bool = True,
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         """Return token IDs, corrected logits, and optional raw confidence logits.
 
         Each correction and confidence prediction uses the preceding token:
@@ -211,7 +212,10 @@ class DSparkModel(nn.Module):
 
         With draft_topk, only the top base-logit candidates receive Markov
         corrections; all other corrected logits are -inf. This approximates
-        the proposal, never the target's verification distribution.
+        the proposal, never the target's verification distribution. A caller
+        that reads only the IDs passes ``corrected_logits=False`` and gets
+        ``None`` in their place, which skips the dense vocabulary tensor the
+        top-K path would otherwise build for every position.
         """
         self.backbone.validate_anchor_metadata(anchors)
         self.backbone.validate_embeddings(hidden, 0)
@@ -238,6 +242,8 @@ class DSparkModel(nn.Module):
             if indices is None:
                 step_logits = logits[:, i] + self.markov_head.markov_w2(embedding)
                 previous = mx.argmax(step_logits, axis=-1)
+                if corrected_logits:
+                    corrected.append(step_logits)
             else:
                 assert values is not None
                 weights = self.markov_head.markov_w2.weight[indices[:, i]]
@@ -247,14 +253,16 @@ class DSparkModel(nn.Module):
                 previous = mx.take_along_axis(indices[:, i], choice, axis=-1).squeeze(
                     -1
                 )
-                step_logits = mx.put_along_axis(
-                    mx.full_like(logits[:, i], -float("inf")),
-                    indices[:, i],
-                    candidate_logits,
-                    axis=-1,
-                )
+                if corrected_logits:
+                    corrected.append(
+                        mx.put_along_axis(
+                            mx.full_like(logits[:, i], -float("inf")),
+                            indices[:, i],
+                            candidate_logits,
+                            axis=-1,
+                        )
+                    )
             tokens.append(previous)
-            corrected.append(step_logits)
         confidence = None
         if self.confidence_head is not None:
             inputs = hidden
@@ -267,7 +275,11 @@ class DSparkModel(nn.Module):
                     axis=-1,
                 )
             confidence = self.confidence_head(inputs)
-        return mx.stack(tokens, axis=1), mx.stack(corrected, axis=1), confidence
+        return (
+            mx.stack(tokens, axis=1),
+            mx.stack(corrected, axis=1) if corrected_logits else None,
+            confidence,
+        )
 
     def draft(
         self,
@@ -276,7 +288,7 @@ class DSparkModel(nn.Module):
         *,
         num_draft_tokens: int,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         hidden = self.block_hidden(anchors, features, num_draft_tokens=num_draft_tokens)
         return self.greedy_proposal(hidden, anchors, draft_topk=draft_topk)
 

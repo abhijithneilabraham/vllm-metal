@@ -107,11 +107,14 @@ class DSparkProposer(BlockDraftProposer):
 
     def _compile_draft(self, width: int) -> DraftForward:
         assert isinstance(self.cache, DSparkPagedCache)
-        draft = self.cache.compile_draft(
-            num_draft_tokens=width, draft_topk=self.draft_topk
-        )
         # The paged adapter has already applied the sequential Markov head.
-        # Return its IDs without enabling confidence-based truncation.
+        # Only its IDs are read, without confidence-based truncation, so the
+        # corrected logits are never built.
+        draft = self.cache.compile_draft(
+            num_draft_tokens=width,
+            draft_topk=self.draft_topk,
+            corrected_logits=False,
+        )
         return lambda anchors, rows: draft(anchors, rows)[0]
 
     def _profile_draft(self, anchors: mx.array, features: Sequence[mx.array]) -> None:

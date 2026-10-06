@@ -283,3 +283,34 @@ def test_dspark_width_rejection_does_not_write_shared_storage():
     assert not proposer._valid_ends
     for buffer, expected in zip(cache.storage.buffers, before, strict=True):
         np.testing.assert_array_equal(np.array(buffer), expected)
+
+
+def test_compiled_draft_reads_only_the_token_ids(monkeypatch):
+    model, cache = make_cache()
+    proposer = DSparkProposer(
+        model,
+        num_draft_tokens=7,
+        controller=SpeculativeDecodeController(),
+        draft_topk=8,
+    )
+    proposer.bind_cache(cache.storage, group_index=1, max_model_len=16)
+    requested = {}
+
+    def compile_draft(**kwargs):
+        requested.update(kwargs)
+        return lambda anchors, rows: (
+            mx.zeros((1, kwargs["num_draft_tokens"])),
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(proposer.cache, "compile_draft", compile_draft)
+
+    draft = proposer._compile_draft(3)
+
+    assert requested == {
+        "num_draft_tokens": 3,
+        "draft_topk": 8,
+        "corrected_logits": False,
+    }
+    assert draft(mx.array([4]), []).shape == (1, 3)
