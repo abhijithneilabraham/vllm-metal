@@ -300,7 +300,9 @@ class MetalPlatform(Platform):
         ):
             raise VLLMValidationError(
                 "Logprobs are not supported for diffusion models on Metal yet.",
-                parameter="logprobs",
+                parameter="logprobs"
+                if params.logprobs is not None
+                else "prompt_logprobs",
             )
         # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
         # Metal one does not, so refuse them rather than ignore them.
