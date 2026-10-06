@@ -31,6 +31,7 @@ and output head and predicts from slot zero, with sequential Markov corrections.
 from __future__ import annotations
 
 import json
+import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -282,10 +283,17 @@ class DSparkModel(nn.Module):
 
     @staticmethod
     def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:
-        if draft_topk is not None and (
-            type(draft_topk) is not int or not 1 <= draft_topk <= vocab_size
+        if draft_topk is None:
+            return
+        if (
+            isinstance(draft_topk, bool)
+            or not isinstance(draft_topk, numbers.Integral)
+            or not 1 <= draft_topk <= vocab_size
         ):
-            raise ValueError("DSpark draft_topk must be an integer in [1, vocab_size]")
+            raise ValueError(
+                f"DSpark draft_topk must be an integer in [1, {vocab_size}], "
+                f"got {draft_topk!r}"
+            )
 
     def validate_anchors(self, anchors: mx.array) -> None:
         self.backbone.validate_anchors(anchors)

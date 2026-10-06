@@ -196,10 +196,22 @@ def test_candidate_limit_excludes_outside_winner_and_preserves_token_id_ties(dty
 
 @pytest.mark.parametrize("draft_topk", [0, -1, 65, True, 1.5])
 def test_invalid_candidate_limit_is_rejected(draft_topk):
-    with pytest.raises(ValueError, match="draft_topk"):
+    with pytest.raises(ValueError, match="draft_topk") as excinfo:
         DSparkModel(config()).greedy_proposal(
             mx.zeros((1, 7, 32)), mx.array([3]), draft_topk=draft_topk
         )
+    assert f"[1, 64], got {draft_topk!r}" in str(excinfo.value)
+
+
+def test_candidate_limit_accepts_any_integer_type():
+    model = DSparkModel(config())
+    hidden = mx.random.normal((2, 7, 32))
+    anchors = mx.array([3, 5])
+    expected = model.greedy_proposal(hidden, anchors, draft_topk=2)[0]
+
+    actual = model.greedy_proposal(hidden, anchors, draft_topk=np.int64(2))[0]
+
+    assert actual.tolist() == expected.tolist()
 
 
 def test_markov_and_confidence_follow_previous_prediction_not_anchor_or_current_token():
