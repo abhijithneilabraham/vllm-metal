@@ -2,6 +2,7 @@
 """Tests for shared Metal utilities."""
 
 import importlib.metadata
+import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +14,7 @@ import pytest
 from tools.attention_bench_utils import attention_tolerances, package_versions
 from vllm_metal.utils import (
     _parse_swap_out_bytes,
+    _swap_out_bytes,
     get_model_download_path,
     probe_commit,
     set_wired_limit,
@@ -155,3 +157,55 @@ def test_swap_out_counter_needs_both_the_page_size_and_the_swapouts_line(
 ) -> None:
     with pytest.raises(ValueError, match="missing"):
         _parse_swap_out_bytes(output)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("no vm_stat"),
+        subprocess.CalledProcessError(1, "vm_stat"),
+        subprocess.TimeoutExpired("vm_stat", 5.0),
+    ],
+    ids=["missing", "failed", "hung"],
+)
+def test_swap_out_counter_is_none_when_vm_stat_fails(monkeypatch, caplog, failure):
+    # A diagnostic must not end model load: the probe reports the signal as
+    # unknown and says why.
+    def run(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "run", run)
+    caplog.set_level("WARNING", logger="vllm_metal.utils")
+
+    assert _swap_out_bytes() is None
+    assert "swap counter" in caplog.text
+
+
+def test_swap_out_counter_is_none_when_vm_stat_output_is_unexpected(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "???", "")
+    )
+
+    assert _swap_out_bytes() is None
+
+
+def test_swap_out_counter_reads_with_a_timeout(monkeypatch):
+    seen = {}
+
+    def run(*args, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, _VM_STAT, "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert _swap_out_bytes() == 15761162 * 16384
+    assert seen["timeout"] > 0
+
+
+def test_probe_commit_reports_an_unknown_paging_signal(monkeypatch):
+    monkeypatch.setattr("vllm_metal.utils._swap_out_bytes", lambda: None)
+
+    probe = probe_commit(1 << 20)
+
+    assert probe.swap_out_bytes is None
+    assert "swap out unknown" in probe.describe()

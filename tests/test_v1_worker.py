@@ -740,6 +740,7 @@ class TestCommitProbeBudget:
         swap_out_bytes: int = 0,
         per_block_bytes: int = 1_000_000,
         turboquant_workspace: int = 0,
+        swap_counter_readable: bool = True,
     ):
         worker = _make_worker(
             SimpleNamespace(
@@ -768,8 +769,10 @@ class TestCommitProbeBudget:
             assert nbytes == min(_PLANNED_KV_BUDGET, KV_COMMIT_SAMPLE_BYTES)
             return CommitProbe(
                 probed_bytes=nbytes,
-                swap_out_before=1_000,
-                swap_out_after=1_000 + swap_out_bytes,
+                swap_out_before=1_000 if swap_counter_readable else None,
+                swap_out_after=1_000 + swap_out_bytes
+                if swap_counter_readable
+                else None,
                 available_before=free_bytes,
                 available_after=free_bytes,
                 seconds=0.01,
@@ -777,6 +780,17 @@ class TestCommitProbeBudget:
 
         monkeypatch.setattr("vllm_metal.v1.cache_policy.probe_commit", fake_probe)
         return planner._paged_attention_plan(overhead=100_000_000)
+
+    def test_unreadable_swap_counter_skips_the_paging_check(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="vllm_metal.v1.cache_policy")
+
+        plan = self._plan(monkeypatch, free_bytes=2 << 30, swap_counter_readable=False)
+
+        assert plan.kv_budget == _PLANNED_KV_BUDGET
+        assert plan.num_blocks == 2_900
+        assert "paging check was skipped" in caplog.text
 
     def test_pool_that_fits_free_memory_is_left_alone(
         self, monkeypatch: pytest.MonkeyPatch
@@ -947,6 +961,18 @@ class TestKvPoolBytesAfterProbe:
 
     def test_free_memory_short_of_the_plan_is_not_a_reason_to_shrink(self) -> None:
         assert self._fit(6 << 30, self._probe(2 << 30, 512 << 20, 0)) == 6 << 30
+
+    def test_unknown_paging_signal_keeps_the_plan(self) -> None:
+        probe = CommitProbe(
+            probed_bytes=512 << 20,
+            swap_out_before=None,
+            swap_out_after=None,
+            available_before=2 << 30,
+            available_after=2 << 30,
+            seconds=0.0,
+        )
+
+        assert self._fit(6 << 30, probe) == 6 << 30
 
     def test_paging_beyond_the_tolerance_caps_at_free_memory(self) -> None:
         probe = self._probe(3 << 30, 512 << 20, self._TOLERANCE + 1)

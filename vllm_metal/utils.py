@@ -19,6 +19,7 @@ _PAGE_STRIDE = mmap.PAGESIZE
 # ``vm_stat`` prints both counters; only the second one tracks the swap file.
 _PAGE_SIZE_RE = re.compile(r"page size of (\d+) bytes")
 _SWAP_OUTS_RE = re.compile(r"^Swapouts:\s*(\d+)\.", re.MULTILINE)
+_VM_STAT_TIMEOUT_SECONDS = 5.0
 
 
 def _parse_swap_out_bytes(vm_stat_output: str) -> int:
@@ -34,8 +35,8 @@ def _parse_swap_out_bytes(vm_stat_output: str) -> int:
     return int(swap_outs.group(1)) * int(page_size.group(1))
 
 
-def _swap_out_bytes() -> int:
-    """Cumulative bytes the kernel has written to the swap file.
+def _swap_out_bytes() -> int | None:
+    """Cumulative bytes the kernel has written to the swap file, or ``None``.
 
     Not ``psutil.swap_memory().sout``: on macOS that is the *Pageouts* counter,
     which counts page-outs generally and so also moves for file writeback that
@@ -44,11 +45,23 @@ def _swap_out_bytes() -> int:
     Swap occupancy is wrong for a different reason: it falls as readily as it
     rises, so a machine that pages 128 MiB out while reclaiming 128 MiB back
     reads as no change at all.
+
+    ``None`` means the counter could not be read: ``vm_stat`` is missing, hung
+    past its timeout, failed, or printed something else. A diagnostic must not
+    end model load, so the probe reports the signal as unknown instead.
     """
-    output = subprocess.run(
-        ["/usr/bin/vm_stat"], capture_output=True, text=True, check=True
-    ).stdout
-    return _parse_swap_out_bytes(output)
+    try:
+        output = subprocess.run(
+            ["/usr/bin/vm_stat"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=_VM_STAT_TIMEOUT_SECONDS,
+        ).stdout
+        return _parse_swap_out_bytes(output)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("Could not read the swap counter from vm_stat: %s", exc)
+        return None
 
 
 def get_model_download_path(
@@ -137,27 +150,34 @@ class CommitProbe:
     """
 
     probed_bytes: int
-    swap_out_before: int
-    swap_out_after: int
+    swap_out_before: int | None
+    swap_out_after: int | None
     available_before: int
     available_after: int
     seconds: float
 
     @property
-    def swap_out_bytes(self) -> int:
+    def swap_out_bytes(self) -> int | None:
         """Bytes the kernel wrote to the swap file while the sample was resident.
 
         A cumulative count, so it cannot be hidden by reclamation, unlike swap
-        occupancy.
+        occupancy. ``None`` when the counter could not be read.
         """
+        if self.swap_out_before is None or self.swap_out_after is None:
+            return None
         return max(0, self.swap_out_after - self.swap_out_before)
 
     def describe(self) -> str:
+        swap_out = (
+            "unknown"
+            if self.swap_out_bytes is None
+            else f"+{self.swap_out_bytes / 2**20:.0f} MiB"
+        )
         return (
             f"forced {self.probed_bytes / 2**20:.0f} MiB resident in "
             f"{self.seconds:.2f}s: available "
             f"{self.available_before / 2**30:.1f}->{self.available_after / 2**30:.1f} GiB, "
-            f"swap out +{self.swap_out_bytes / 2**20:.0f} MiB"
+            f"swap out {swap_out}"
         )
 
 
@@ -208,7 +228,7 @@ def probe_commit(nbytes: int) -> CommitProbe:
     # Read after the mapping is gone, so these describe the machine with the
     # probe's memory already back. Swap-outs are cumulative, so the paging the
     # probe caused is counted whether it happened before or after the release.
-    swap_out_after = _swap_out_bytes()
+    swap_out_after = _swap_out_bytes() if swap_out_before is not None else None
     available_after = int(psutil.virtual_memory().available)
 
     return CommitProbe(

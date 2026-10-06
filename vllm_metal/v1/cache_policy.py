@@ -288,8 +288,12 @@ def kv_pool_bytes_after_probe(
     commitment. The lazy pool backs blocks as requests use them, and giving
     back capacity an idle pool never needed is the regression the lazy
     allocation exists to avoid.
+
+    An unknown paging signal (the swap counter could not be read) keeps the
+    plan as well: there is no evidence of paging to act on, and the caller
+    says so.
     """
-    if probe.swap_out_bytes <= swap_tolerance_bytes:
+    if probe.swap_out_bytes is None or probe.swap_out_bytes <= swap_tolerance_bytes:
         return plan_bytes
     cap = probe.available_before - reserve_bytes - future_reserved_bytes
     return min(plan_bytes, max(0, cap))
@@ -1220,6 +1224,13 @@ class WorkerCachePlanner:
             future_reserved_bytes=future_reserved_bytes,
             swap_tolerance_bytes=kv_swap_tolerance_bytes(probe.probed_bytes),
         )
+        if probe.swap_out_bytes is None:
+            logger.warning(
+                "KV commit probe: the swap counter could not be read, so the "
+                "paging check was skipped and the plan stands. %s",
+                probe.describe(),
+            )
+            return plan
         if fit >= plan.kv_budget:
             if plan.kv_budget > probe.available_before:
                 logger.warning(
