@@ -344,6 +344,27 @@ class TestSleepMode:
 
         assert calls == []
 
+    def test_wake_after_a_failed_release_does_not_restore(self) -> None:
+        """vLLM marks the KV cache as sleeping even when discard raised, so
+        wake_up must succeed or the engine never resumes scheduling."""
+
+        def release() -> None:
+            raise NotImplementedError("unsupported KV cache")
+
+        restores: list[str] = []
+        worker = _make_worker(
+            SimpleNamespace(
+                release_kv_cache_memory=release,
+                restore_kv_cache_memory=lambda: restores.append("restore"),
+            )
+        )
+
+        with pytest.raises(NotImplementedError, match="unsupported KV cache"):
+            MetalWorker.discard(worker, ("kv_cache",))
+        MetalWorker.wake_up(worker, tags=["kv_cache"])
+
+        assert restores == []
+
 
 class TestSleepReleasesHostPool:
     """Sleep frees the KV offloading host pool with the KV cache."""
