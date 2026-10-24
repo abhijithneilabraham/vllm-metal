@@ -1004,6 +1004,10 @@ class MetalModelRunner:
     def tq_prefill_workspace_bytes(self) -> int:
         return self._cache_policy.tq_prefill_workspace_bytes
 
+    @property
+    def moe_expert_reserved_bytes(self) -> int:
+        return 0 if self._expert_store is None else self._expert_store.reserved_bytes
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
@@ -1183,8 +1187,9 @@ class MetalModelRunner:
         overhead = mx.get_cache_memory() - cache_before
         mx.set_cache_limit(overhead)
         if self._expert_store is not None:
-            # The profile touched every expert; the plan reserves the cache
-            # budget itself, so start serving from an empty cache.
+            # The dummy batch routes every token to the same top_k experts,
+            # so profiling sees little of the expert memory. The plan reserves
+            # it instead; start serving from an empty cache.
             self._expert_store.clear()
         return overhead
 

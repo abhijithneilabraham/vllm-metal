@@ -546,6 +546,26 @@ def test_turboquant_workspace_stays_out_of_the_room(monkeypatch) -> None:
     )
 
 
+def test_moe_expert_reserve_stays_out_of_the_room(monkeypatch) -> None:
+    """Streamed experts arrive after profiling, so the room excludes the
+    expert reserve just as the probe does."""
+    reserved = 200_000_000
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.get_config",
+        lambda: MetalConfig(mlx_device="gpu", moe_expert_cache_bytes=reserved),
+    )
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
+    planner._worker.model_runner.moe_expert_reserved_bytes = reserved
+    past_reserve = 300_000_000
+    _paging_probe(monkeypatch, free=_RESERVE + reserved + past_reserve)
+
+    assert planner.determine_available_memory() == past_reserve * 3 // 4
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
+        past_reserve // 4
+    )
+
+
 _PAST = [0, 1_000_000, 50_000_000, _REQUEST, _REQUEST + 1_000_000, 187_500_000]
 _PAST += [300_000_000, _AUTO - 1, _AUTO, _AUTO + 1, _GB, 3 * _GB, 4 * _GB]
 

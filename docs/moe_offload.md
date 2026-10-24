@@ -23,8 +23,10 @@ vllm serve mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit \
 |-----|-------------|
 | `moe_expert_offload.cache_gb` | Memory for cached experts, in GiB. Required to enable offloading. |
 
-The KV cache budget reserves `cache_gb` before sizing, so the resident model,
-the expert cache and the KV cache fit `--gpu-memory-utilization` together.
+The KV cache budget reserves `cache_gb` plus one layer of experts before
+sizing, since a long prefill stacks nearly every expert of a layer at once. The
+resident model, the expert cache and the KV cache then fit
+`--gpu-memory-utilization` together.
 
 ## Choosing the cache size
 

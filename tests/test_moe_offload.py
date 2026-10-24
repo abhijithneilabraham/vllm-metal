@@ -115,6 +115,15 @@ def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint) -> None:
     assert (store.hits, store.misses) == (3, 5)
 
 
+def test_reserve_covers_the_cache_and_one_stacked_layer(checkpoint) -> None:
+    reference, model_dir = checkpoint
+    cache_bytes = 2 * _expert_bytes(reference)
+
+    _, store = _offloaded_twin(reference, model_dir, cache_bytes)
+
+    assert store.reserved_bytes == cache_bytes + NUM_EXPERTS * _expert_bytes(reference)
+
+
 @pytest.mark.parametrize(
     ("drop", "match"),
     [

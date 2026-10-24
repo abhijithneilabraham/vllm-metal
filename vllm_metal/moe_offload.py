@@ -80,9 +80,13 @@ class ExpertStore:
         self,
         index: dict[str, TensorLocation],
         cache_bytes: int,
+        stack_bytes: int,
     ) -> None:
         self._index = index
         self._cache_bytes = cache_bytes
+        # A forward stacks the experts it touches on top of the cache, and a
+        # long prefill touches nearly every expert of a layer.
+        self.reserved_bytes = cache_bytes + stack_bytes
         self._entries: OrderedDict[tuple[str, int], dict[str, dict[str, mx.array]]] = (
             OrderedDict()
         )
@@ -113,7 +117,11 @@ class ExpertStore:
         targets = cls._switch_layers(model)
         for path, module in targets:
             cls._validate_layer(index, path, module)
-        store = cls(index, cache_bytes)
+        stack_bytes = max(
+            cls._layer_bytes(index, path, module.gate_proj.num_experts)
+            for path, module in targets
+        )
+        store = cls(index, cache_bytes, stack_bytes)
         model.update_modules(
             tree_unflatten(
                 [
@@ -250,6 +258,23 @@ class ExpertStore:
                             "'<block>.switch_mlp.<proj>.<component>' and "
                             "per-expert '<block>.experts.<j>.<proj>.<component>'."
                         )
+
+    @classmethod
+    def _layer_bytes(
+        cls, index: dict[str, TensorLocation], module_path: str, num_experts: int
+    ) -> int:
+        return sum(
+            piece.nbytes
+            for expert in range(num_experts)
+            for projection in cls.PROJECTIONS
+            for component in cls.COMPONENTS
+            if (
+                piece := cls._expert_slice(
+                    index, module_path, projection, component, expert
+                )
+            )
+            is not None
+        )
 
     @classmethod
     def _expert_slice(
