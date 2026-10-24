@@ -45,8 +45,8 @@ from vllm_metal.config import (
     MetalConfig,
     get_config,
 )
-from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
+from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.utils import CommitProbe, probe_commit
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
@@ -222,6 +222,25 @@ def _no_room_message(kv_budget: int, request: int, min_pool: int) -> str:
     )
 
 
+def _paging_message(room: int, request: int, min_pool: int) -> str:
+    """Startup error when a paging machine has no room for one request and
+    one host chunk. Never advises --kv-offloading-size, which the user did
+    not set."""
+    left = (
+        "KV offloading on Metal: the machine is paging, and the memory left "
+        f"for KV cache and host pool ({room / 2**20:.1f} MiB) cannot hold one "
+        f"--max-model-len request ({request / 2**20:.1f} MiB)"
+    )
+    if request > room:
+        # Not even one request fits, with or without offloading.
+        return f"{left}. Free memory on the machine or lower --max-model-len."
+    return (
+        f"{left} and the smallest host pool ({min_pool / 2**20:.1f} MiB). Free "
+        "memory on the machine, lower --max-model-len, or start without KV "
+        "offloading."
+    )
+
+
 def uses_metal_offloading(vllm_config: VllmConfig) -> bool:
     """True when the Metal offloading connector is configured.
 
@@ -248,6 +267,7 @@ class _PagedAttentionPlan:
     # KV offload host pool. Pageable, but the same physical RAM as the wired
     # cache on unified memory, so it comes out of the same budget.
     kv_offload_pool: int = 0
+    kv_offload_pool_auto: bool = False
     sized_down_by_probe: bool = False
 
     def format_breakdown(self) -> str:
@@ -276,7 +296,8 @@ class _PagedAttentionPlan:
                 f"increase --gpu-memory-utilization (currently {self.fraction})",
                 "use a smaller or more quantized model",
             ]
-        if self.kv_offload_pool:
+        # An automatic pool was sized for the user, who never set the flag.
+        if self.kv_offload_pool and not self.kv_offload_pool_auto:
             mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
 
@@ -433,9 +454,7 @@ class ModelCachePolicy:
         return plan
 
     def _uses_upstream_storage(self) -> bool:
-        return self._runner.is_hybrid or (
-            not self._runner.is_mla and self._runner._draft_dims is None
-        )
+        return self._runner.is_hybrid or self._runner._draft_dims is None
 
     def _uses_grouped_attention(self) -> bool:
         """Return whether the scheduler keeps distinct attention-window groups."""
@@ -631,7 +650,7 @@ class ModelCachePolicy:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """Bind layout-driven caches from the final engine configuration.
 
-        Count-initialized speculative/MLA runtimes adopt the engine's groups;
+        Count-initialized draft-model runtimes adopt the engine's groups;
         other runtimes bind the engine's shared backing here.
         """
         self._adopt_draft_scheduler_group(kv_cache_config)
@@ -693,8 +712,12 @@ class ModelCachePolicy:
             )
             return
         model_layer_names = self._attention_layer_names()
-        runtime = self._build_sdpa_backend(
-            block_size=self._runner.cache_config.block_size
+        runtime = (
+            self._build_mla_backend(self._runner.cache_config.block_size)
+            if self._runner.is_mla
+            else self._build_sdpa_backend(
+                block_size=self._runner.cache_config.block_size
+            )
         )
         runtime.initialize_from_config(kv_cache_config, model_layer_names)
         n_patched = runtime.patch_model(self._runner.model)
@@ -1033,22 +1056,34 @@ class WorkerCachePlanner:
         self._worker.model_runner.validate_paged_attention_support()
         plan = self._paged_attention_plan(overhead=overhead)
         self._validate_paged_attention_plan(plan, require_min_blocks=True)
+        num_blocks = plan.num_blocks
+        override = self._worker.vllm_config.cache_config.num_gpu_blocks_override
+        if override is not None:
+            if override <= 0:
+                raise ValueError("--num-gpu-blocks-override must be positive")
+            if override > num_blocks:
+                raise ValueError(
+                    f"--num-gpu-blocks-override={override} exceeds the planned "
+                    f"Metal cache capacity of {num_blocks} blocks. "
+                    "Lower or remove the override."
+                )
+            num_blocks = override
         logger.info(
             "Paged attention memory breakdown: "
             "%s, per_block_bytes=%d, "
             "num_blocks=%d, max_tokens_cached=%d",
             plan.format_breakdown(),
             plan.per_block_bytes,
-            plan.num_blocks,
-            plan.num_blocks * plan.block_size,
+            num_blocks,
+            num_blocks * plan.block_size,
         )
 
         backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
-        # Hybrid models always size their cache from vLLM's KV cache config
+        # Only draft-model speculation still sizes its pool here
         # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
-        # MLA runtimes, which own ``initialize``, reach this path.
+        # MLA target runtimes, which own ``initialize``, reach this path.
         if not isinstance(
             backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
         ):
@@ -1057,14 +1092,14 @@ class WorkerCachePlanner:
                 f"and MLA runtimes; {type(backend).__name__} sizes its cache "
                 "from vLLM's KV cache config"
             )
-        backend.initialize(plan.num_blocks)
+        backend.initialize(num_blocks)
         self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
             block_size=plan.block_size,
         )
         n_patched = backend.patch_model(self._worker.model_runner.model)
         self._worker.model_runner.install_drafter(
-            num_blocks=plan.num_blocks,
+            num_blocks=num_blocks,
             block_size=plan.block_size,
         )
         config = get_config()
@@ -1078,7 +1113,7 @@ class WorkerCachePlanner:
             "Paged attention enabled: %d layers patched, "
             "%d blocks allocated (block_size=%d, mla=%s, turboquant=%s, k_quant=%s)",
             n_patched,
-            plan.num_blocks,
+            num_blocks,
             plan.block_size,
             self._worker.model_runner.is_mla,
             config.turboquant,
@@ -1193,7 +1228,7 @@ class WorkerCachePlanner:
         )
         kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
         kv_budget = base_kv_budget - kv_offload_pool
-        plan = self._probe_committed_pool(
+        plan, room = self._probe_committed_pool(
             _PagedAttentionPlan(
                 block_size=block_size,
                 fraction=fraction,
@@ -1205,25 +1240,33 @@ class WorkerCachePlanner:
                 kv_budget=kv_budget,
                 num_blocks=max(0, kv_budget // per_block_bytes),
                 kv_offload_pool=kv_offload_pool,
+                kv_offload_pool_auto=self._auto_pool_extra() is not None,
             ),
             future_reserved_bytes=future_reserved_bytes,
         )
-        if plan.kv_offload_pool and 0 < plan.kv_budget < kv_budget:
+        if room is not None and plan.kv_offload_pool:
             # The probe shrank only the KV cache. Re-cap an automatic pool
-            # against what is left. A probe result of 0 is floored, so it does
-            # not say how much is left; plan validation then fails as before.
-            total = plan.kv_budget + plan.kv_offload_pool
+            # against the room the probe sees for KV cache and pool.
             pool = self._recap_kv_offload_pool(
-                total, plan.kv_offload_pool, per_block_bytes
+                room, plan.kv_offload_pool, per_block_bytes
             )
             if pool < plan.kv_offload_pool:
                 plan = replace(
                     plan,
-                    kv_budget=total - pool,
-                    num_blocks=(total - pool) // per_block_bytes,
+                    kv_budget=room - pool,
+                    num_blocks=(room - pool) // per_block_bytes,
                     kv_offload_pool=pool,
                 )
         return plan
+
+    def _auto_pool_extra(self) -> dict | None:
+        """Connector config of an automatic Metal host pool, else None."""
+        vllm_config = self._worker.vllm_config
+        if not uses_metal_offloading(vllm_config):
+            return None
+        assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        return extra if extra.get(AUTO_POOL_KEY) is True else None
 
     def _auto_pool_limits(
         self, kv_budget: int, per_block_bytes: int
@@ -1232,13 +1275,10 @@ class WorkerCachePlanner:
 
         None for a user-set size, which is never capped.
         """
+        extra = self._auto_pool_extra()
+        if extra is None:
+            return None
         vllm_config = self._worker.vllm_config
-        if not uses_metal_offloading(vllm_config):
-            return None
-        assert vllm_config.kv_transfer_config is not None
-        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        if extra.get(AUTO_POOL_KEY) is not True:
-            return None
         cache_config = vllm_config.cache_config
         block_size = cache_config.block_size
         cap = int(kv_budget * _AUTO_POOL_MAX_SHARE)
@@ -1303,19 +1343,27 @@ class WorkerCachePlanner:
     ) -> int:
         """Cap an automatic pool again after the commit probe shrank the budget.
 
-        ``total`` is what the probe left for KV cache and pool together. The
-        pool only shrinks; if a request then does not fit, vLLM's
-        max_model_len check reports it.
+        ``total`` is the room the probe sees for KV cache and pool together.
+        The pool only shrinks. If one request and the smallest pool do not
+        fit, startup fails and says the machine is paging.
         """
         limits = self._auto_pool_limits(total, per_block_bytes)
         if limits is None:
             return pool
-        cap, min_pool, _, extra = limits
+        cap, min_pool, request, extra = limits
         new_pool = min(pool, _bounded_pool(pool, cap, min_pool))
+        if request and total - new_pool < request:
+            raise ValueError(_paging_message(total, request, min_pool))
+        if total < new_pool:
+            # No request reserved (--max-model-len -1 or a block override) and
+            # not even one chunk fits. Plan validation, or vLLM with the
+            # override, decides as without the re-cap.
+            return pool
         if new_pool < pool:
             logger.warning(
                 "KV offloading host pool cut from %.2f to %.2f GB after the "
-                "commit probe; the KV cache gets the difference, %.2f GB",
+                "commit probe; the KV cache gets the difference, %.2f GB, "
+                "in place of the size logged above",
                 pool / 1e9,
                 new_pool / 1e9,
                 (total - new_pool) / 1e9,
@@ -1325,7 +1373,7 @@ class WorkerCachePlanner:
 
     def _probe_committed_pool(
         self, plan: _PagedAttentionPlan, *, future_reserved_bytes: int = 0
-    ) -> _PagedAttentionPlan:
+    ) -> tuple[_PagedAttentionPlan, int | None]:
         """Check the plan against the machine before serving starts.
 
         The budget follows ``--gpu-memory-utilization`` against Metal's
@@ -1341,13 +1389,17 @@ class WorkerCachePlanner:
         pool backs blocks as requests use them, so an idle pool never needs the
         capacity the plan allows, and shrinking to whatever happens to be free
         today would hand back the capacity the lazy allocation exists to keep.
+
+        Also returns the room the probe sees for KV cache and pool together
+        when it shrank the plan, else None.
         """
         if not envs.VLLM_METAL_KV_COMMIT_PROBE or plan.kv_budget <= 0:
-            return plan
+            return plan, None
 
         # The offload host pool is allocated later, is pageable, and shares the
         # same physical RAM, so it is held back from the cap exactly as the KV
         # budget holds it back from the Metal budget.
+        other_reserved_bytes = future_reserved_bytes
         future_reserved_bytes += plan.kv_offload_pool
 
         probe = probe_commit(min(plan.kv_budget, KV_COMMIT_SAMPLE_BYTES))
@@ -1383,7 +1435,7 @@ class WorkerCachePlanner:
                     probe.available_before / 1e9,
                     probe.describe(),
                 )
-            return plan
+            return plan, None
 
         # Keep the unrounded fit as the budget: vLLM picks its own grouped
         # layout from the bytes it is handed, so rounding here to the dense
@@ -1400,9 +1452,15 @@ class WorkerCachePlanner:
             plan.fraction,
             probe.describe(),
         )
-
-        return replace(
-            plan, kv_budget=fit, num_blocks=num_blocks, sized_down_by_probe=True
+        # The room for KV cache and pool together. Unlike ``fit`` it is not
+        # floored by the pool, so an automatic pool can be re-capped even when
+        # the pool alone fills it.
+        room = probe.available_before - reserve_bytes - other_reserved_bytes
+        return (
+            replace(
+                plan, kv_budget=fit, num_blocks=num_blocks, sized_down_by_probe=True
+            ),
+            max(0, room),
         )
 
     def _validate_paged_attention_plan(

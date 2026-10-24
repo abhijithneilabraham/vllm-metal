@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare greedy paged serving with the environment's native mlx-lm.
+"""Compare greedy serving with mlx-lm.
 
 Generate one native reference, then compare individual and batched requests.
 Speculative modes observe target verification in isolated engine workers;
@@ -34,7 +34,11 @@ else:
 
 
 def mlx_generate(
-    model_path: str, prompts: list[str], max_tokens: int, top_k: int | None = None
+    model_path: str,
+    prompts: list[str],
+    max_tokens: int,
+    top_k: int | None = None,
+    trust_remote_code: bool = False,
 ) -> list[dict]:
     import mlx.core as mx
     import numpy as np
@@ -42,10 +46,17 @@ def mlx_generate(
     from mlx_lm.generate import generate_step
     from mlx_lm.sample_utils import make_sampler
 
-    from vllm_metal.compat import _patch_transformers_exaone4_config
+    from vllm_metal.compat import (
+        _patch_mlx_lm_minicpm4_model_type,
+        _patch_transformers_exaone4_config,
+    )
 
     _patch_transformers_exaone4_config()
-    model, tokenizer = load(model_path)
+    _patch_mlx_lm_minicpm4_model_type()
+    # Mirror the server, which passes the setting to the tokenizer only.
+    model, tokenizer = load(
+        model_path, tokenizer_config={"trust_remote_code": trust_remote_code}
+    )
     results = []
     for prompt in prompts:
         input_ids = tokenizer.encode(prompt)
@@ -95,6 +106,7 @@ def serving(
     log_path: Path,
     env: dict,
     additional_config: str | None = None,
+    trust_remote_code: bool = False,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -123,6 +135,7 @@ def serving(
                 "--generation-config",
                 "vllm",
             ]
+            + (["--trust-remote-code"] if trust_remote_code else [])
             + (["--additional-config", additional_config] if additional_config else []),
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -165,6 +178,7 @@ def check_parity(
     output_dir: Path | None = None,
     gpu_memory_utilization: float = 0.65,
     additional_config: str | None = None,
+    trust_remote_code: bool = False,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -182,6 +196,8 @@ def check_parity(
         model = snapshot_download(model)
     model = str(Path(model).resolve())
     env = os.environ.copy()
+    if env.get("VLLM_METAL_BACKEND", "mlx") == "mps":
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
@@ -189,7 +205,7 @@ def check_parity(
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
-    print("Generating native MLX reference...", flush=True)
+    print("Generating native mlx-lm reference...", flush=True)
     with (output_dir / "reference.log").open("w") as log:
         subprocess.run(
             [
@@ -202,7 +218,8 @@ def check_parity(
                 "--generate-reference",
                 str(reference_path),
             ]
-            + (["--top-k", str(top_k)] if top_k is not None else []),
+            + (["--top-k", str(top_k)] if top_k is not None else [])
+            + (["--trust-remote-code"] if trust_remote_code else []),
             check=True,
             env=env,
             stdout=log,
@@ -220,6 +237,7 @@ def check_parity(
         output_dir / "serve.log",
         env,
         additional_config,
+        trust_remote_code,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -379,6 +397,11 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom code from the checkpoint, for both backends",
+    )
+    parser.add_argument(
         "--additional-config",
         help="JSON passed to vllm serve --additional-config (serving side only)",
     )
@@ -391,8 +414,12 @@ def main() -> None:
     if min(args.batch_size) < 1 or len(set(args.batch_size)) != len(args.batch_size):
         parser.error("--batch-size values must be positive and unique")
     if args.method is not None:
+        if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
+            parser.error("--method requires the MLX backend")
         if args.generate_reference:
             parser.error("--generate-reference cannot be combined with --method")
+        if args.trust_remote_code:
+            parser.error("--trust-remote-code cannot be combined with --method")
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from tools import speculative_parity
 
@@ -416,7 +443,9 @@ def main() -> None:
         parser.error("Draft and continuation-audit options require --method")
     if args.generate_reference:
         prompts = json.loads(args.generate_reference.read_text())
-        reference = mlx_generate(args.model, prompts, args.max_tokens, args.top_k)
+        reference = mlx_generate(
+            args.model, prompts, args.max_tokens, args.top_k, args.trust_remote_code
+        )
         args.generate_reference.write_text(json.dumps(reference))
         return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
@@ -429,6 +458,7 @@ def main() -> None:
         args.output_dir,
         args.gpu_memory_utilization,
         args.additional_config,
+        args.trust_remote_code,
     )
     raise SystemExit(0 if passed else 1)
 

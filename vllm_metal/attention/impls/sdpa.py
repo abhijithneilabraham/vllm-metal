@@ -63,6 +63,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
+from vllm_metal.attention.nax_split import nax_split_kwargs, nax_tile_work
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -541,6 +542,40 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     return cached[1]
 
 
+def llama4_query_scale(
+    ctx: PagedAttentionContext,
+    beta: float,
+    original_max_position_embeddings: int,
+) -> mx.array | None:
+    """Per-row Llama 4 query scale ``(1, 1, L, 1)`` for the packed batch.
+
+    The scale is ``1 + beta * log(1 + floor(pos / original_max))`` at each
+    row's absolute position, as in mlx_lm's ``ministral3``. It is exactly 1
+    below ``original_max``, so ``None`` is returned when no row reaches it.
+    Computed once per forward and shared by every scaled layer.
+    """
+    key = (beta, original_max_position_embeddings)
+    if key in ctx.llama4_query_scales:
+        return ctx.llama4_query_scales[key]
+    cu_seqlens = ctx.cu_seqlens
+    assert cu_seqlens is not None
+    segments = list(zip(cu_seqlens[:-1], cu_seqlens[1:], ctx.offsets, strict=True))
+    scale = None
+    if any(
+        offset + end - start > original_max_position_embeddings
+        for start, end, offset in segments
+    ):
+        positions = mx.concatenate(
+            [mx.arange(offset, offset + end - start) for start, end, offset in segments]
+        )
+        scale = (
+            1
+            + beta * mx.log(1 + mx.floor(positions / original_max_position_embeddings))
+        )[None, None, :, None]
+    ctx.llama4_query_scales[key] = scale
+    return scale
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -552,12 +587,16 @@ def sdpa_forward(
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
     attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
+    llama4_scaling: tuple[float, int] | None = None,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm/RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
     the broadcast internally.
+
+    ``llama4_scaling`` is ``(beta, original_max_position_embeddings)`` for
+    attention that scales queries by position after RoPE (Ministral 3).
 
     Returns:
         Tuple of (output, kv_pair) where kv_pair is (keys, values)
@@ -620,6 +659,10 @@ def sdpa_forward(
         # StableLM computes the standard scale inline and exposes no scale
         # attribute. Use the projected query width before any cache padding.
         attn_scale = math.sqrt(1 / queries.shape[-1])
+    if llama4_scaling is not None:
+        query_scale = llama4_query_scale(ctx, *llama4_scaling)
+        if query_scale is not None:
+            queries = queries * query_scale.astype(queries.dtype)
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]
@@ -802,7 +845,6 @@ def sdpa_forward(
     mm_kwargs = (
         {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
     )
-    out = mx.array(0)
     if kv_cache.turboquant:
         # Preserve the compressed primitive's layout and rejection contracts
         # for decode, short continuations, verification, sinks and image rows.
@@ -828,8 +870,7 @@ def sdpa_forward(
         def quantized_attention(
             query: mx.array, batch: _AttentionBatch | _KernelMetadata
         ) -> mx.array:
-            result = mx.array(0)
-            ops.paged_attention_primitive(
+            return ops.paged_attention_primitive(
                 query,
                 kernel_k_cache,
                 kernel_v_cache,
@@ -842,7 +883,6 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                result,
                 sinks=sinks,
                 key_scale_cache=kernel_key_scale,
                 value_scale_cache=kernel_value_scale,
@@ -854,7 +894,6 @@ def sdpa_forward(
                 window_seqlen_q=ctx.verify_window_q,
                 **mm_kwargs,
             )
-            return result
 
         plan = None
         has_prefill = q_3d.shape[0] > len(ctx.context_lens)
@@ -922,7 +961,9 @@ def sdpa_forward(
             )
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
-            ops.paged_attention_primitive(
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
+            out = ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
                 v16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -935,8 +976,11 @@ def sdpa_forward(
                 kernel_block_size,
                 batch.max_seq_len,
                 layer_sliding_window,
-                out,
                 window_seqlen_q=ctx.verify_window_q,
+                # The dequantized lane only admits full-attention layers.
+                **nax_split_kwargs(
+                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
+                ),
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -976,20 +1020,71 @@ def sdpa_forward(
                 num_decode_tokens=ctx.num_decode_tokens,
                 max_decode_context_len=ctx.max_decode_context_len,
             )
+        num_decode = ctx.num_decode_requests
+        ordinary_decode_rows = (
+            not ctx.gqa_disabled
+            and num_decode == ctx.num_decode_tokens
+            and ctx.verify_window_q == 1
+        )
         if (
             capabilities["gqa_length_plan"]
-            and not ctx.gqa_disabled
-            and ctx.num_decode_requests > 1
-            and ctx.num_decode_requests
-            == ctx.num_decode_tokens
-            == q_3d.shape[0]
-            == len(ctx.context_lens)
-            and ctx.verify_window_q == 1
+            and ordinary_decode_rows
+            and num_decode > 1
+            and num_decode == q_3d.shape[0] == len(ctx.context_lens)
         ):
             if ctx.gqa_length_plan is None:
                 ctx.gqa_length_plan = ops.gqa_decode_length_plan(ctx.context_lens)
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
-        ops.paged_attention_primitive(
+        elif (
+            capabilities["gqa_mixed_decode_plan"]
+            and ordinary_decode_rows
+            and 0 < num_decode < len(ctx.context_lens)
+            and q_3d.shape[0] > num_decode
+        ):
+            # Mixed batch: describe only the leading decode rows. Native code
+            # uses it when it splits those rows from the prefill kernel.
+            if ctx.gqa_length_plan is None:
+                ctx.gqa_length_plan = ops.gqa_decode_length_plan(
+                    ctx.context_lens[:num_decode]
+                )
+            paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+            # Prefill batch: pick the NAX pipeline from per-sequence lengths
+            # the kernel dispatcher could only read back from the GPU.
+            # Native alone decides whether to split off ordinary decode rows.
+            work = prefill_work = None
+            if (
+                ctx.cu_seqlens is not None
+                and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
+                and ctx.cu_seqlens[-1] == q_3d.shape[0]
+            ):
+                if ctx.nax_tile_work is None:
+                    ctx.nax_tile_work = {}
+
+                def tile_work(first_seq: int):
+                    key = (layer_sliding_window, first_seq)
+                    if key not in ctx.nax_tile_work:
+                        ctx.nax_tile_work[key] = nax_tile_work(
+                            ctx.cu_seqlens[first_seq:],
+                            ctx.context_lens[first_seq:],
+                            layer_sliding_window,
+                        )
+                    return ctx.nax_tile_work[key]
+
+                work = tile_work(0)
+                if (
+                    capabilities["nax_prefill_split_hint"]
+                    and 0 < num_decode < len(ctx.context_lens)
+                    and num_decode == ctx.num_decode_tokens
+                    and ctx.verify_window_q == 1
+                ):
+                    prefill_work = tile_work(num_decode)
+            paged_kwargs.update(
+                nax_split_kwargs(
+                    capabilities, work, q_3d.shape[2], prefill_work=prefill_work
+                )
+            )
+        out = ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,
             kernel_v_cache,
@@ -1002,7 +1097,6 @@ def sdpa_forward(
             kernel_block_size,
             max_seq_len,
             layer_sliding_window,
-            out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
             **paged_kwargs,

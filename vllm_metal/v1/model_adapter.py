@@ -180,6 +180,13 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``lora_weights_mapper: WeightsMapper`` (default ``None``): rewrites PEFT
+      adapter module names from the HF checkpoint layout to the names of the
+      wrapped MLX modules. Without it the LoRA manager maps the HF text-model
+      prefix onto the wrapped tree (``peft_loader.default_weights_mapper``).
+    - ``lora_encoder_target() -> EncoderLoRATarget`` (default absent): the
+      vision tower and connector that ``--enable-tower-connector-lora``
+      adapts.  Without it the flag is rejected.
     - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
       kinds (``"sliding"``, ``"full"``) on which the rows of an image block
       attend to the whole block, not only causally.  Gemma 4 sets
@@ -399,6 +406,11 @@ _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
         "Qwen3_6MoeForConditionalGeneration",
     }
 )
+# Mistral 3 text models that mlx_lm's mistral3 wrapper loads. mistral4 text is
+# MLA, which that wrapper does not load, so it keeps the native path.
+_MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
+    {"mistral", "ministral3"}
+)
 _QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
@@ -426,6 +438,10 @@ class DefaultModelAdapter(ModelAdapter):
         Gemma4: mlx_vlm forward currently produces garbled output; remove this
         override once mlx_vlm Gemma4 parity is fixed upstream.
 
+        Mistral 3: no multimodal adapter yet. The text backbone clears
+        ``multimodal_config``, so the frontend rejects image input instead of
+        the runner raising on it.
+
         Qwen3.5/Qwen3.6 conditional-generation wrappers: these configs are
         marked multimodal even when served text-only, and the FP8 family fails
         under mlx_vlm.load() on `*_weight_scale_inv` tensors, so it routes
@@ -440,6 +456,10 @@ class DefaultModelAdapter(ModelAdapter):
         model_type_from_hf = hf_config.model_type
         if model_type_from_hf in _GEMMA4_MODEL_TYPES:
             return True
+        if model_type_from_hf == "mistral3":
+            text_config = getattr(hf_config, "text_config", None)
+            text_type = getattr(text_config, "model_type", None)
+            return text_type in _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES
 
         architectures_from_hf = tuple(hf_config.architectures or ())
         has_text_backbone_architecture = any(
@@ -552,8 +572,9 @@ class DefaultModelAdapter(ModelAdapter):
         that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
-        kept but restricted to images only, so the frontend rejects video
-        and audio inputs the sidecar cannot serve. ``native`` leaves the
+        kept but video is turned off, and audio too unless the checkpoint has
+        an audio encoder, so the frontend rejects inputs the sidecar cannot
+        serve. ``native`` leaves the
         config untouched. :meth:`multimodal_backbone_mode` is the single
         source of truth for which mode applies.
         """
@@ -574,22 +595,32 @@ class DefaultModelAdapter(ModelAdapter):
             )
             return
         if mode == "text_sidecar":
-            self._restrict_to_images(model_config.multimodal_config)
+            # Only E2B/E4B carry an audio encoder; the processor and the
+            # sidecar both follow ``audio_config``.
+            keep_audio = getattr(hf_config, "audio_config", None) is not None
+            self._restrict_to_images(
+                model_config.multimodal_config, keep_audio=keep_audio
+            )
             logger.info(
-                "Metal: Gemma 4 serves images through the vision sidecar on the "
-                "mlx_lm text backbone; video and audio inputs are refused"
+                "Metal: Gemma 4 serves %s through the encoder sidecar on the "
+                "mlx_lm text backbone; %s inputs are refused",
+                "images and audio" if keep_audio else "images",
+                "video" if keep_audio else "video and audio",
             )
 
     @staticmethod
-    def _restrict_to_images(multimodal_config: Any) -> None:
-        """Set video/audio limits to 0 so the frontend rejects them (idempotent)."""
+    def _restrict_to_images(
+        multimodal_config: Any, *, keep_audio: bool = False
+    ) -> None:
+        """Set video (and audio, unless kept) limits to 0 so the frontend
+        rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
+        refused: list[tuple[str, type]] = [("video", VideoDummyOptions)]
+        if not keep_audio:
+            refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt
-        for modality, options_cls in (
-            ("video", VideoDummyOptions),
-            ("audio", AudioDummyOptions),
-        ):
+        for modality, options_cls in refused:
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(
@@ -935,7 +966,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
 
             return cast(
                 MultimodalRuntimeAdapter,
-                Qwen3VLMultimodalAdapter.from_loaded_model(model),
+                Qwen3VLMultimodalAdapter.from_loaded_model(model, hf_config),
             )
 
         if model_type in _PADDLEOCR_VL_MODEL_TYPES or any(

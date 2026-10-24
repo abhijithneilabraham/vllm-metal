@@ -3,22 +3,17 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, cast
 
-from huggingface_hub import snapshot_download
-
-try:
-    import gguf
-except ImportError as exc:
-    raise ImportError(
-        "GGUF support requires the optional 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+import gguf
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model, load_tokenizer
 
@@ -33,6 +28,7 @@ __all__ = ["GGUFLoadError", "GGUFModelLoader"]
 _WEIGHT_SUFFIX = ".weight"
 _BIAS_SUFFIX = ".bias"
 _NUM_LAYERS_KEYS = ("num_hidden_layers", "n_layers", "num_layers", "n_layer")
+_QUANTIZATION_KEYS = ("quantization", "quantization_config")
 _PLAIN_GGUF_TYPES = frozenset(
     {
         gguf.GGMLQuantizationType.F32,
@@ -121,9 +117,7 @@ class GGUFModelLoader:
 
         # Build the mlx-lm skeleton lazily; the GGUF replaces every parameter, so
         # its own weights are never materialized.
-        model, _ = load_model(
-            self._config_dir, lazy=True, strict=False, model_config=config
-        )
+        model = self._build_skeleton(config)
         tied = bool(getattr(model.args, "tie_word_embeddings", False))
         self._preflight_deferred_output(reader, tied=tied)
 
@@ -203,6 +197,19 @@ class GGUFModelLoader:
                     f"Unsupported qtype {tensor.tensor_type.name} on bias {name!r}; "
                     f"additive biases must be plain {_PLAIN_QTYPE_NAMES}."
                 )
+
+    @staticmethod
+    def _build_skeleton(config: dict[str, Any]) -> nn.Module:
+        """Build the mlx-lm skeleton from the companion config alone."""
+        skeleton_config = {
+            key: value for key, value in config.items() if key not in _QUANTIZATION_KEYS
+        }
+        with TemporaryDirectory(prefix="vllm-metal-gguf-") as config_only_dir:
+            (Path(config_only_dir) / "config.json").write_text(
+                json.dumps(skeleton_config)
+            )
+            model, _ = load_model(Path(config_only_dir), lazy=True, strict=False)
+        return model
 
     def _preflight_deferred_output(self, reader: Any, *, tied: bool) -> None:
         """Validate ``output.weight`` after the live model resolves weight tying.

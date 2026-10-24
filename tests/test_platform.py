@@ -2,6 +2,7 @@
 """Tests for Metal platform."""
 
 import importlib
+import json
 import os
 import platform
 import re
@@ -17,7 +18,10 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.config.multimodal import MultiModalConfig
+from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
+from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -39,6 +43,24 @@ from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+_TINY_NEMOTRON_H_CONFIG = {
+    "architectures": ["NemotronHForCausalLM"],
+    "model_type": "nemotron_h",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "hybrid_override_pattern": "M*",
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 8,
+    "ssm_state_size": 16,
+    "n_groups": 1,
+    "vocab_size": 256,
+    "max_position_embeddings": 4096,
+}
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +171,7 @@ class TestMetalPlatform:
                 block_size=None,
             ),
             model_config=SimpleNamespace(
+                enable_sleep_mode=False,
                 model=model,
                 disable_cascade_attn=False,
                 tokenizer=tokenizer,
@@ -225,8 +248,16 @@ class TestMetalPlatform:
         [
             (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
             (SamplingParams(min_tokens=2), "min_tokens"),
+            (
+                SamplingParams(thinking_token_budget=64),
+                "thinking_token_budget",
+            ),
+            (
+                SamplingParams(thinking_token_budget=0),
+                "thinking_token_budget",
+            ),
         ],
-        ids=["logit-bias", "min-tokens"],
+        ids=["logit-bias", "min-tokens", "thinking-budget", "thinking-budget-zero"],
     )
     def test_validate_request_rejects_logits_processor_controls(
         self,
@@ -236,6 +267,98 @@ class TestMetalPlatform:
         with pytest.raises(VLLMValidationError, match=control) as exc_info:
             MetalPlatform.validate_request({}, sampling_params)
         assert exc_info.value.parameter == control
+
+    @pytest.mark.parametrize(
+        ("pooling_params", "parameter", "message"),
+        [
+            (
+                PoolingParams(
+                    task="embed",
+                    late_interaction_params=LateInteractionParams(
+                        mode="cache_query", query_key="query-0"
+                    ),
+                ),
+                "late_interaction_params",
+                "late-interaction",
+            ),
+            (
+                PoolingParams(task="embed", requires_token_ids=True),
+                "requires_token_ids",
+                "token-level ALL",
+            ),
+            (PoolingParams(task="embed", step_tag_id=1), "step_tag_id", "STEP"),
+            (
+                PoolingParams(task="embed", returned_token_ids=[1]),
+                "returned_token_ids",
+                "returned_token_ids",
+            ),
+            (
+                PoolingParams(task="embed", extra_kwargs={"foo": True}),
+                "extra_kwargs",
+                "extra pooling kwargs",
+            ),
+            (
+                PoolingParams(task="embed", use_activation=False),
+                "use_activation",
+                "use_activation=False",
+            ),
+        ],
+        ids=[
+            "late-interaction",
+            "token-ids",
+            "step-tag",
+            "returned-token-ids",
+            "extra-kwargs",
+            "embed-no-activation",
+        ],
+    )
+    def test_validate_request_rejects_unsupported_pooling_options(
+        self,
+        pooling_params: PoolingParams,
+        parameter: str,
+        message: str,
+    ) -> None:
+        """The engine treats runner exceptions as fatal, so reject up front."""
+        with pytest.raises(VLLMValidationError, match=message) as exc_info:
+            MetalPlatform.validate_request({}, pooling_params)
+        assert exc_info.value.parameter == parameter
+
+    @pytest.mark.parametrize(
+        "pooling_params",
+        [
+            PoolingParams(task="embed", use_activation=True),
+            PoolingParams(task="classify", use_activation=False),
+        ],
+        ids=["embed", "classify-no-activation"],
+    )
+    def test_validate_request_accepts_supported_pooling_options(
+        self, pooling_params: PoolingParams
+    ) -> None:
+        MetalPlatform.validate_request({}, pooling_params)
+
+    def test_sleep_mode_is_available(self) -> None:
+        assert MetalPlatform.is_sleep_mode_available()
+
+    def test_check_and_update_config_rejects_sleep_mode_with_model_drafting(
+        self,
+    ) -> None:
+        vllm_config = self._platform_config(
+            model_config=SimpleNamespace(enable_sleep_mode=True),
+            speculative_config=SimpleNamespace(method="draft_model"),
+        )
+        with pytest.raises(NotImplementedError, match="only n-gram"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_sleep_mode_on_mps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_BACKEND", "mps")
+        vllm_config = self._platform_config(
+            model_config=SimpleNamespace(enable_sleep_mode=True),
+            speculative_config=None,
+        )
+        with pytest.raises(NotImplementedError, match="MLX backend only"):
+            MetalPlatform.check_and_update_config(vllm_config)
 
     def test_validate_request_accepts_min_p(self) -> None:
         MetalPlatform.validate_request({}, SamplingParams(min_p=0.2))
@@ -292,7 +415,7 @@ class TestMetalPlatform:
             (None, None, False),
             ("auto_awq", None, True),
             ("gguf", None, True),
-            ("auto_awq", SimpleNamespace(language_model_only=False), False),
+            ("auto_awq", MultiModalConfig(), False),
         ],
         ids=["safetensors", "text-awq", "text-gguf", "multimodal-awq"],
     )
@@ -300,7 +423,7 @@ class TestMetalPlatform:
         self,
         monkeypatch: pytest.MonkeyPatch,
         quantization: str | None,
-        multimodal_config: SimpleNamespace | None,
+        multimodal_config: MultiModalConfig | None,
         rejects_pp: bool,
     ) -> None:
         """PP admits lazy loaders and rejects proven eager text loaders."""
@@ -320,6 +443,7 @@ class TestMetalPlatform:
                     block_size=None,
                 ),
                 model_config=SimpleNamespace(
+                    enable_sleep_mode=False,
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
@@ -475,6 +599,7 @@ class TestMetalPlatform:
                 disable_custom_all_reduce=False,
             ),
             model_config=SimpleNamespace(
+                enable_sleep_mode=False,
                 model="openai/whisper-tiny",
                 revision=revision,
                 disable_cascade_attn=False,
@@ -620,6 +745,7 @@ class TestMetalPlatform:
             "hf_config": SimpleNamespace(model_type="qwen3"),
             "is_hybrid": False,
             "dtype": torch.float16,
+            "enable_sleep_mode": False,
         }
         model_fields.update(model or {})
         return self._platform_config(
@@ -922,7 +1048,7 @@ class TestMetalPlatform:
                     "distributed_executor_backend": "ray",
                     "ray_runtime_env": None,
                 },
-                model={"multimodal_config": SimpleNamespace()},
+                model={"multimodal_config": MultiModalConfig()},
             )
             with pytest.raises(NotImplementedError, match="multimodal models"):
                 MetalPlatform.check_and_update_config(vllm_config)
@@ -1207,6 +1333,7 @@ class TestMetalPlatform:
                     enable_prefix_caching=False,
                 ),
                 model_config=SimpleNamespace(
+                    enable_sleep_mode=False,
                     model="test-model",
                     disable_cascade_attn=False,
                     tokenizer=None,
@@ -1260,6 +1387,7 @@ class TestMetalPlatform:
                     model_type=text_model_type or model_type
                 ),
                 is_hybrid=True,
+                enable_sleep_mode=False,
             ),
             scheduler_config=SimpleNamespace(
                 async_scheduling=True,
@@ -1292,37 +1420,16 @@ class TestMetalPlatform:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
-    def test_check_and_update_config_rejects_hybrid_all_cache_mode(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mamba_cache_mode='all' fails fast on every path, before downgrades."""
-        self._patch_stt_resolution(monkeypatch, is_stt=False)
-        reset_config()
-        try:
-            vllm_config = self._hybrid_vllm_config(
-                SimpleNamespace(
-                    block_size=None,
-                    kv_cache_dtype_skip_layers=[],
-                    enable_prefix_caching=True,
-                    mamba_cache_mode="all",
-                    mamba_ssm_cache_dtype="float32",
-                ),
-            )
-            with pytest.raises(NotImplementedError, match="mamba_cache_mode='all'"):
-                MetalPlatform.check_and_update_config(vllm_config)
-        finally:
-            reset_config()
-
-    def test_check_and_update_config_downgrades_default_hybrid_prefix_caching(
+    def test_check_and_update_config_rejects_non_ngram_hybrid_speculation(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Hybrid combinations Metal cannot serve downgrade APC, not reject.
+        """Hybrid targets reject non-ngram speculators at config time.
 
-        vLLM 0.28.0 enables prefix caching by default for hybrid models and
-        resolves mamba_cache_mode='align' / mamba_block_size=block_size before
-        the platform hook runs; failing here would fail every default launch.
-        The downgrade restores the upstream APC-off resolution.
+        Verify-span staging and acceptance rollback exist only for the ngram
+        method on GDN-family targets; any other pairing must fail fast here
+        rather than at the first verify forward. Rejecting (not downgrading)
+        is safe: no hybrid+speculative configuration ran before.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
@@ -1341,51 +1448,167 @@ class TestMetalPlatform:
                     num_speculative_tokens=2,
                 ),
             )
-            # Upstream resolves mamba_block_size = block_size AFTER CacheConfig
-            # construction (models/config.py), so user_specified stays False.
             vllm_config.cache_config.mamba_block_size = 16
-            assert vllm_config.cache_config.user_specified_mamba_block_size is False
+            with pytest.raises(
+                NotImplementedError,
+                match="ngram method on GDN-family targets only",
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_ngram_for_non_gdn_hybrid(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ngram on a non-GDN hybrid family is rejected at config time.
+
+        mamba2/KDA/shortconv wrappers flush span-final state in place with no
+        rollback, so a partial accept would silently corrupt recurrent state.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+                model_type="nemotron_h",
+            )
+            with pytest.raises(
+                NotImplementedError,
+                match="ngram method on GDN-family targets only",
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_hybrid_ngram_requires_lazy_gdn_kernels(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Hybrid GDN verification runs multi-token spans through the lazy
+        scan kernels; disabling them must fail at config time, not mid-forward."""
+        monkeypatch.setenv("VLLM_METAL_GDN_LAZY_KERNELS", "0")
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=False,
+                    mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+            )
+            with pytest.raises(
+                NotImplementedError, match="requires the lazy GDN kernels"
+            ):
+                MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_accepts_hybrid_ngram_align_prefix_caching(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ngram on a GDN hybrid keeps align-mode prefix caching enabled.
+
+        Verification stages GDN state per verify span and caps drafts at the
+        state-block boundary (gdn_spec), keeping align checkpoints exact.
+        """
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        reset_config()
+        try:
+            vllm_config = self._hybrid_vllm_config(
+                SimpleNamespace(
+                    block_size=16,
+                    kv_cache_dtype_skip_layers=[],
+                    enable_prefix_caching=True,
+                    mamba_cache_mode="align",
+                    mamba_ssm_cache_dtype="float32",
+                ),
+                speculative_config=SimpleNamespace(
+                    method="ngram",
+                    use_heterogeneous_vocab=False,
+                    num_speculative_tokens=3,
+                ),
+            )
+            vllm_config.cache_config.mamba_block_size = 16
             MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
 
         cache_config = vllm_config.cache_config
-        assert cache_config.enable_prefix_caching is False
-        assert cache_config.mamba_cache_mode == "none"
-        assert cache_config.mamba_block_size == 32768
+        assert cache_config.enable_prefix_caching is True
+        assert cache_config.mamba_cache_mode == "align"
+        assert cache_config.mamba_block_size == 16
 
+    @pytest.mark.parametrize(("block_size", "mamba_block_size"), [(16, 64), (32, 16)])
     def test_hybrid_prefix_caching_downgrade_rejects_user_mamba_block_size(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, block_size: int, mamba_block_size: int
     ) -> None:
         """An explicit --mamba-block-size fails fast when APC must be downgraded.
 
-        Once the hook disables prefix caching, upstream's
-        validate_mamba_block_size (an after-validator) would reject the kept
-        value with a misleading message; the Metal constraint wins instead.
+        The remaining APC downgrade is for state families without align-mode
+        support (e.g. slot-keyed nemotron_h). vLLM fills an unset
+        mamba_block_size with block_size before the hook, so any other value
+        is the user's, which needs prefix caching.
         """
         self._patch_stt_resolution(monkeypatch, is_stt=False)
         reset_config()
         try:
             vllm_config = self._hybrid_vllm_config(
                 SimpleNamespace(
-                    block_size=16,
+                    block_size=block_size,
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
                     mamba_cache_mode="align",
-                    mamba_block_size=64,
+                    mamba_block_size=mamba_block_size,
                     mamba_ssm_cache_dtype="float32",
                 ),
-                speculative_config=SimpleNamespace(
-                    method="draft_model",
-                    use_heterogeneous_vocab=False,
-                    num_speculative_tokens=2,
-                ),
+                model_type="nemotron_h",
             )
-            assert vllm_config.cache_config.user_specified_mamba_block_size is True
             with pytest.raises(NotImplementedError, match="mamba-block-size"):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
+
+    def test_hybrid_prefix_caching_downgrade_when_mamba_block_size_is_omitted(
+        self, tmp_path
+    ) -> None:
+        """vLLM fills an omitted mamba_block_size before the platform hook, so a
+        default Nemotron-H launch downgrades instead of reading it as the user's."""
+        (tmp_path / "config.json").write_text(json.dumps(_TINY_NEMOTRON_H_CONFIG))
+        reset_config()
+        try:
+            vllm_config = EngineArgs(
+                model=str(tmp_path), max_model_len=4096
+            ).create_engine_config()
+        finally:
+            reset_config()
+
+        cache_config = vllm_config.cache_config
+        assert (
+            cache_config.enable_prefix_caching,
+            cache_config.mamba_cache_mode,
+            cache_config.mamba_block_size,
+        ) == (False, "none", 4096)
 
     @pytest.mark.parametrize("model_type", ["nemotron_h", "granitemoehybrid"])
     def test_check_and_update_config_downgrades_prefix_caching_for_slot_keyed_families(
@@ -1595,8 +1818,9 @@ class TestMetalPlatform:
             monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", mode)
         reset_config()
         try:
-            multimodal_config = SimpleNamespace(language_model_only=False)
+            multimodal_config = MultiModalConfig()
             model_config = SimpleNamespace(
+                enable_sleep_mode=False,
                 model="test-model",
                 disable_cascade_attn=False,
                 tokenizer=None,
@@ -1616,6 +1840,37 @@ class TestMetalPlatform:
             assert model_config.multimodal_config is expected
         finally:
             reset_config()
+
+    def test_kept_multimodal_config_normalizes_pixels_on_the_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MLX vision towers take the processor's normalized pixels."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        multimodal_config = MultiModalConfig(mm_device_do_normalize=True)
+        model_config = SimpleNamespace(
+            enable_sleep_mode=False,
+            model="test-model",
+            tokenizer=None,
+            max_model_len=128,
+            multimodal_config=multimodal_config,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_vl",
+                architectures=["Qwen3VLForConditionalGeneration"],
+            ),
+            is_hybrid=False,
+        )
+        reset_config()
+        try:
+            vllm_config = self._platform_config(
+                model_config=model_config,
+                cache_config=SimpleNamespace(enable_prefix_caching=False),
+            )
+
+            MetalPlatform.check_and_update_config(vllm_config)
+        finally:
+            reset_config()
+
+        assert multimodal_config.merge_mm_processor_kwargs({}) == {}
 
     def test_synchronize_runs_mlx_barrier(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1758,6 +2013,7 @@ class TestMetalPlatform:
         )
         self._patch_stt_resolution(monkeypatch, False)
         model_config = SimpleNamespace(
+            enable_sleep_mode=False,
             model="test-model",
             disable_cascade_attn=False,
             tokenizer=None,
@@ -1773,7 +2029,7 @@ class TestMetalPlatform:
             text_config=SimpleNamespace(model_type="gemma4_text"),
             vision_config=SimpleNamespace(default_output_length=280),
         )
-        model_config.multimodal_config = SimpleNamespace()
+        model_config.multimodal_config = MultiModalConfig()
         model_config.mm_processor_kwargs = mm_processor_kwargs
         return self._platform_config(
             model_config=model_config,
