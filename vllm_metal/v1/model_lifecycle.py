@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
@@ -21,7 +20,7 @@ from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
-from vllm_metal.moe_offload import install_expert_offload, resolve_checkpoint_dir
+from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
@@ -430,12 +429,9 @@ class ModelLifecycle:
                 revision=revision,
             )
             if expert_cache_bytes:
-                self._runner._expert_store = install_expert_offload(
-                    model,
-                    resolve_checkpoint_dir(model_name, revision),
-                    expert_cache_bytes,
+                self._runner._expert_store = ExpertStore.install(
+                    model, model_name, revision, expert_cache_bytes
                 )
-                mx.eval(model.parameters())
 
         loaded_from = (
             gguf_source.weights_path if gguf_source is not None else model_name
