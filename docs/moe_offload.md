@@ -47,6 +47,6 @@ waits for its routing before it reads experts, and misses read from the SSD.
   `<block>.experts.<j>` (OLMoE and Qwen1.5-MoE conversions).
 - Shared experts, attention and embeddings stay resident.
 
-Not supported: GGUF, AWQ and multimodal checkpoints, pipeline parallelism,
-LoRA, speculative decoding, and checkpoints that name expert projections
-differently (Mixtral's `w1`/`w2`/`w3`).
+Not supported: the MPS backend, GGUF, AWQ and multimodal checkpoints,
+pipeline parallelism, LoRA, speculative decoding, and checkpoints that name
+expert projections differently (Mixtral's `w1`/`w2`/`w3`).

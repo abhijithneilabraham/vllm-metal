@@ -190,4 +190,17 @@ class TestPlatformGuards:
             setattr(vllm_config, field, value)
 
         with pytest.raises(NotImplementedError, match=match):
-            MetalPlatform._check_moe_expert_offload_config(vllm_config)
+            MetalPlatform._check_moe_expert_offload_config(vllm_config, "mlx")
+
+    def test_mps_backend_is_rejected(self) -> None:
+        from vllm_metal.platform import MetalPlatform
+
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(runner_type="generate"),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+            lora_config=None,
+            speculative_config=None,
+        )
+
+        with pytest.raises(NotImplementedError, match="MLX backend only"):
+            MetalPlatform._check_moe_expert_offload_config(vllm_config, "mps")
