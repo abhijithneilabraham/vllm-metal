@@ -235,17 +235,21 @@ class ExpertStore:
     ) -> None:
         last = module.gate_proj.num_experts - 1
         for projection in cls.PROJECTIONS:
-            for expert in (0, last):
-                piece = cls._expert_slice(
-                    index, module_path, projection, "weight", expert
-                )
-                if piece is None:
-                    raise KeyError(
-                        "MoE expert offloading found no checkpoint tensor for "
-                        f"{module_path}.{projection} expert {expert}. Supported "
-                        "layouts: stacked '<block>.switch_mlp.<proj>.<component>' "
-                        "and per-expert '<block>.experts.<j>.<proj>.<component>'."
+            for component in cls.COMPONENTS:
+                if module[projection].get(component) is None:
+                    continue
+                for expert in (0, last):
+                    piece = cls._expert_slice(
+                        index, module_path, projection, component, expert
                     )
+                    if piece is None:
+                        raise KeyError(
+                            "MoE expert offloading found no checkpoint tensor for "
+                            f"{module_path}.{projection}.{component} expert "
+                            f"{expert}. Supported layouts: stacked "
+                            "'<block>.switch_mlp.<proj>.<component>' and "
+                            "per-expert '<block>.experts.<j>.<proj>.<component>'."
+                        )
 
     @classmethod
     def _expert_slice(

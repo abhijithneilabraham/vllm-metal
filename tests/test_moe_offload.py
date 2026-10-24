@@ -115,12 +115,19 @@ def test_cache_honours_its_byte_budget_and_counts_hits(checkpoint) -> None:
     assert (store.hits, store.misses) == (3, 5)
 
 
-def test_missing_expert_tensors_fail_at_install(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("drop", "match"),
+    [
+        ("weight", "layers.0.mlp.switch_mlp.down_proj.weight expert 0"),
+        ("scales", "layers.0.mlp.switch_mlp.down_proj.scales expert 0"),
+    ],
+)
+def test_missing_expert_tensors_fail_at_install(tmp_path, drop, match) -> None:
     reference = _tiny_olmoe(seed=1)
     broken = tmp_path / "broken"
-    _save_checkpoint(reference, broken, per_expert=False, drop="down_proj.weight")
+    _save_checkpoint(reference, broken, per_expert=False, drop=f"down_proj.{drop}")
 
-    with pytest.raises(KeyError, match="layers.0.mlp.switch_mlp.down_proj expert 0"):
+    with pytest.raises(KeyError, match=match):
         ExpertStore.install(_tiny_olmoe(seed=3), str(broken), None, 1 << 20)
 
 
